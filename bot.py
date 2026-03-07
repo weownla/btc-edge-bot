@@ -79,7 +79,7 @@ def format_signal_message(data: dict) -> str:
     minute = data.get("min", 0)
     
     mins_remaining = 60 - minute
-    fires = "🔥" * min(score, 7)
+    fires = "🔥" * min(score, 5)
     
     if direction == "BULL":
         emoji = "🟢"
@@ -113,7 +113,7 @@ def format_signal_message(data: dict) -> str:
 
 <b>Now:</b> ${price:,.0f}
 <b>Target:</b> ${target:,} (${dist:,.0f} away)
-<b>Score:</b> {score}/7 {fires}
+<b>Score:</b> {score}/5 {fires}
 <b>Time:</b> {mins_remaining} min left
 
 🎯 <b>{bet_line}</b>
