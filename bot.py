@@ -178,63 +178,107 @@ def kalshi_post(path, data):
 def find_btc_hourly_market(direction, target_price):
     """
     Find the Kalshi BTC hourly market matching our signal.
-    Merged approach: tries multiple series tickers, multiple price fields,
-    and logs everything for debugging.
+    
+    From Marc's URL: https://kalshi.com/markets/kxbtcd/bitcoin-price-abovebelow/KXBTCD-26MAR1619
+    Event ticker format: KXBTCD-{YY}{MON}{DD}{HH} where HH is the ET hour
+    
+    Strategy:
+      1. Construct the event ticker for the current hour
+      2. Query /events/{event_ticker} to get all strike markets
+      3. Find the strike closest to our target
+      4. Read the real yes/no ask price
     """
     try:
-        # Step 1: Try multiple series tickers until one returns markets
-        series_to_try = [KALSHI_SERIES_TICKER, "KXBTCD", "KXBTC", "KXBTCUSD"]
-        # Remove duplicates while preserving order
-        seen = set()
-        series_to_try = [s for s in series_to_try if not (s in seen or seen.add(s))]
+        import pytz
+        
+        # Step 1: Get current time in ET (Kalshi uses Eastern Time)
+        utc_now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            et = pytz.timezone('US/Eastern')
+            et_now = utc_now.astimezone(et)
+        except Exception:
+            # Fallback: assume EDT (UTC-4)
+            et_now = utc_now - datetime.timedelta(hours=4)
+        
+        # The current hour's event — the one that settles at the TOP of the next hour
+        # If it's 2:47 PM ET, we want the event that closes at 3:00 PM = hour 15
+        # But Kalshi might label it as hour 14 or 15. Try the current hour first.
+        month_names = {1:'JAN',2:'FEB',3:'MAR',4:'APR',5:'MAY',6:'JUN',
+                       7:'JUL',8:'AUG',9:'SEP',10:'OCT',11:'NOV',12:'DEC'}
+        
+        yy = str(et_now.year)[2:]  # "26"
+        mon = month_names[et_now.month]  # "MAR"
+        dd = f"{et_now.day:02d}"  # "16"
+        
+        # Try current hour and next hour (Kalshi might label either way)
+        hours_to_try = [et_now.hour, et_now.hour + 1]
+        if et_now.hour + 1 > 23:
+            hours_to_try = [et_now.hour]
         
         markets = []
-        used_series = ""
-        for series in series_to_try:
-            path = f"/markets?status=open&series_ticker={series}&limit=200"
+        used_event = ""
+        
+        for hh in hours_to_try:
+            event_ticker = f"KXBTCD-{yy}{mon}{dd}{hh:02d}"
+            path = f"/events/{event_ticker}"
             data = kalshi_get(path)
-            if data and 'markets' in data and len(data['markets']) > 0:
-                markets = data['markets']
-                used_series = series
-                logger.info(f"Found {len(markets)} markets with series={series}")
-                break
+            
+            if data and 'event' in data and 'markets' in data['event']:
+                mkts = data['event']['markets']
+                if len(mkts) > 0:
+                    markets = mkts
+                    used_event = event_ticker
+                    logger.info(f"Found {len(markets)} strikes in event {event_ticker}")
+                    break
+                else:
+                    logger.info(f"Event {event_ticker} exists but has 0 markets")
+            else:
+                logger.info(f"Event {event_ticker} not found, trying next")
+        
+        # Fallback: try previous day's late hours if we're in early morning
+        if not markets and et_now.hour < 4:
+            prev_day = et_now - datetime.timedelta(days=1)
+            dd_prev = f"{prev_day.day:02d}"
+            for hh in [23, 22, 21]:
+                event_ticker = f"KXBTCD-{yy}{mon}{dd_prev}{hh:02d}"
+                data = kalshi_get(f"/events/{event_ticker}")
+                if data and 'event' in data and 'markets' in data['event']:
+                    mkts = data['event']['markets']
+                    if len(mkts) > 0:
+                        markets = mkts
+                        used_event = event_ticker
+                        logger.info(f"Found {len(markets)} strikes in fallback event {event_ticker}")
+                        break
         
         if not markets:
-            logger.error(f"No markets found for any series: {series_to_try}")
+            logger.error(f"No hourly event found for ET hour {et_now.hour} on {et_now.date()}")
             return None, None, None
         
-        # Step 2: Find strike closest to our target
+        # Step 2: Find strike closest to target
         target_rounded = round(target_price / 250) * 250
         best_market = None
         best_diff = float('inf')
         
         for m in markets:
-            ticker = m.get('ticker', '')
-            strike = 0
+            # Get strike from floor_strike (for "above" markets) or cap_strike
+            strike = m.get('floor_strike') or m.get('cap_strike') or 0
             
-            # Priority 1: API strike fields
-            strike = m.get('floor_strike', 0) or m.get('cap_strike', 0) or m.get('strike_price', 0) or 0
+            # Handle .99 strikes (Kalshi uses 73749.99 to mean $73,750)
+            if strike > 0:
+                strike = round(strike)  # 73749.99 → 73750
             
-            # Kalshi may store strikes in cents (7375000 = $73,750)
-            if strike > 1000000:
-                strike = strike / 100
-            
-            # Priority 2: Parse from ticker (format: ...-T73750)
-            if strike == 0 and '-T' in ticker:
-                try:
-                    strike_str = ticker.split('-T')[-1]
-                    strike = float(strike_str)
-                except (ValueError, IndexError):
-                    pass
-            
-            # Priority 3: Parse from title/subtitle
             if strike == 0:
-                text = (m.get('title', '') + ' ' + m.get('subtitle', '')).upper()
-                match = re.search(r'\$(\d{1,3}(?:,\d{3})*)', text)
-                if match:
-                    strike = float(match.group(1).replace(',', ''))
+                # Parse from ticker: KXBTCD-26MAR1619-T73750
+                ticker = m.get('ticker', '')
+                if '-T' in ticker:
+                    try:
+                        strike = round(float(ticker.split('-T')[-1]))
+                    except: pass
+                elif '-B' in ticker:
+                    try:
+                        strike = round(float(ticker.split('-B')[-1]))
+                    except: pass
             
-            # Must be in BTC range
             if not (50000 <= strike <= 200000):
                 continue
             
@@ -244,51 +288,43 @@ def find_btc_hourly_market(direction, target_price):
                 best_market = m
         
         if not best_market:
-            logger.error(f"No market found near ${target_rounded:,} in {len(markets)} markets")
-            # Log first 3 markets for debugging
+            logger.error(f"No strike near ${target_rounded:,} in {used_event} ({len(markets)} markets)")
             for m in markets[:3]:
-                logger.error(f"  Sample market: {m.get('ticker')} | floor_strike={m.get('floor_strike')} | title={m.get('title','')[:60]}")
+                logger.error(f"  Sample: {m.get('ticker')} floor={m.get('floor_strike')} cap={m.get('cap_strike')}")
             return None, None, None
         
         ticker = best_market['ticker']
         
-        # Step 3: Get contract price — try EVERY possible field
+        # Step 3: Get price
         def parse_dollars(val):
-            """Convert '0.0500' to 5 (cents)."""
             if not val: return 0
             try: return int(round(float(val) * 100))
             except: return 0
         
-        # Method A: Dollar string fields (Kalshi v2 API standard)
         yes_ask = parse_dollars(best_market.get('yes_ask_dollars'))
         no_ask = parse_dollars(best_market.get('no_ask_dollars'))
         
-        # Method B: Integer cent fields (some API versions)
         if yes_ask == 0:
-            yes_ask = best_market.get('yes_ask', 0) or 0
+            yes_ask = best_market.get('yes_ask') or 0
         if no_ask == 0:
-            no_ask = best_market.get('no_ask', 0) or 0
+            no_ask = best_market.get('no_ask') or 0
         
-        # Method C: Last price as fallback
         if yes_ask == 0 and no_ask == 0:
             last = parse_dollars(best_market.get('last_price_dollars'))
             if last > 0:
                 yes_ask = last
                 no_ask = 100 - last
         
-        # Method D: Calculate missing side
         if no_ask == 0 and yes_ask > 0:
             no_ask = 100 - yes_ask
         if yes_ask == 0 and no_ask > 0:
             yes_ask = 100 - no_ask
         
-        # Full debug log
-        logger.info(f"MATCH: {ticker} | strike_diff=${best_diff:,.0f}")
-        logger.info(f"  floor_strike={best_market.get('floor_strike')} cap_strike={best_market.get('cap_strike')}")
+        strike_val = round(best_market.get('floor_strike') or best_market.get('cap_strike') or 0)
+        
+        logger.info(f"MATCH: {ticker} | event={used_event} | strike=${strike_val:,}")
         logger.info(f"  yes_ask_dollars={best_market.get('yes_ask_dollars')} no_ask_dollars={best_market.get('no_ask_dollars')}")
-        logger.info(f"  yes_ask={best_market.get('yes_ask')} no_ask={best_market.get('no_ask')}")
-        logger.info(f"  last_price_dollars={best_market.get('last_price_dollars')}")
-        logger.info(f"  PARSED: yes={yes_ask}¢ no={no_ask}¢")
+        logger.info(f"  Parsed: yes={yes_ask}¢ no={no_ask}¢")
         
         if direction == "BEAR":
             side, contract_price = "no", no_ask
@@ -640,32 +676,58 @@ def start_trading():
 
 @app.route("/markets", methods=["GET"])
 def debug_markets():
-    """Debug: show what Kalshi returns for BTC markets."""
+    """Debug: show what Kalshi returns for BTC hourly events."""
     if not check_auth(request):
         return jsonify({"error": "unauthorized"}), 401
     
     results = {}
-    for series in [KALSHI_SERIES_TICKER, "KXBTCD", "KXBTC"]:
-        path = f"/markets?status=open&series_ticker={series}&limit=5"
-        data = kalshi_get(path)
-        if data and 'markets' in data:
-            results[series] = []
-            for m in data['markets'][:3]:
-                results[series].append({
-                    "ticker": m.get('ticker'),
-                    "title": m.get('title', '')[:80],
-                    "floor_strike": m.get('floor_strike'),
-                    "cap_strike": m.get('cap_strike'),
-                    "yes_ask": m.get('yes_ask'),
-                    "no_ask": m.get('no_ask'),
-                    "yes_ask_dollars": m.get('yes_ask_dollars'),
-                    "no_ask_dollars": m.get('no_ask_dollars'),
-                    "last_price_dollars": m.get('last_price_dollars'),
-                    "status": m.get('status'),
-                    "close_time": m.get('close_time'),
-                })
-        else:
-            results[series] = "no markets found"
+    
+    # Show what the events endpoint returns for current hour
+    try:
+        import pytz
+        utc_now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            et = pytz.timezone('US/Eastern')
+            et_now = utc_now.astimezone(et)
+        except:
+            et_now = utc_now - datetime.timedelta(hours=4)
+        
+        month_names = {1:'JAN',2:'FEB',3:'MAR',4:'APR',5:'MAY',6:'JUN',
+                       7:'JUL',8:'AUG',9:'SEP',10:'OCT',11:'NOV',12:'DEC'}
+        yy = str(et_now.year)[2:]
+        mon = month_names[et_now.month]
+        dd = f"{et_now.day:02d}"
+        
+        for hh in [et_now.hour, et_now.hour + 1, et_now.hour - 1]:
+            if hh < 0 or hh > 23: continue
+            event_ticker = f"KXBTCD-{yy}{mon}{dd}{hh:02d}"
+            path = f"/events/{event_ticker}"
+            data = kalshi_get(path)
+            
+            if data and 'event' in data:
+                mkts = data['event'].get('markets', [])
+                results[event_ticker] = {
+                    "title": data['event'].get('title', ''),
+                    "market_count": len(mkts),
+                    "sample_markets": []
+                }
+                for m in mkts[:5]:
+                    results[event_ticker]["sample_markets"].append({
+                        "ticker": m.get('ticker'),
+                        "floor_strike": m.get('floor_strike'),
+                        "cap_strike": m.get('cap_strike'),
+                        "yes_ask_dollars": m.get('yes_ask_dollars'),
+                        "no_ask_dollars": m.get('no_ask_dollars'),
+                        "yes_ask": m.get('yes_ask'),
+                        "no_ask": m.get('no_ask'),
+                        "status": m.get('status'),
+                    })
+            else:
+                results[event_ticker] = "not found"
+        
+        results["et_time"] = et_now.strftime('%Y-%m-%d %H:%M ET')
+    except Exception as e:
+        results["error"] = str(e)
     
     return jsonify(results)
 
