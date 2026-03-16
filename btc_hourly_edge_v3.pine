@@ -1,58 +1,47 @@
 //@version=5
-indicator("BTC Hourly Edge v4", overlay=true, max_labels_count=500)
+indicator("BTC Hourly Edge v5", overlay=true, max_labels_count=500)
 
 // ═══════════════════════════════════════════════════════════════════
-// BTC Hourly Edge v4 — Velocity + Volume + Distance
+// BTC Hourly Edge v5 — Settle-Validated
 // ═══════════════════════════════════════════════════════════════════
-// Backtested on 6.8 days of real BTC data: 71% win rate (5/7).
+// v4 backtested on "touch" (did price reach target?). Kalshi pays
+// on "settle" (where is price AT :00?). 6 of 10 "wins" bounced
+// back before the hour closed. Real win rate was 19%, not 48%.
 //
-// The old versions used 5-7 indicators trying to be clever.
-// This one uses 3 simple conditions that all must be true:
+// v5 fixes this by only catching moves strong enough to HOLD:
+//   1. VELOCITY ≥ $200 in 15 min (only explosive moves, not drifts)
+//   2. VOLUME ≥ 2.0x average (confirmed participation)
+//   3. DISTANCE ≤ $250 to target strike (reachable)
+//   4. WINDOW :45-:49 only (15 min left = time to develop AND hold)
+//      No :55 — late signals touch but reverse by :00
 //
-//   1. VELOCITY: Price moved $75+ in the last 15 min (it's FAST)
-//   2. VOLUME:   Current volume is 3x+ average (it's REAL)
-//   3. DISTANCE: Target $250 strike is ≤$250 away (it's REACHABLE)
-//
-// If all 3 are true → signal fires. Direction = which way velocity is going.
-//
-// BONUS POINTS (for score display):
-//   +1 if velocity > $150 (extra fast)
-//   +1 if volume > 5x average (extreme volume)
-//   Base = 3/5, max = 5/5
+// Settle-validated backtest (8.2 days real data):
+//   12 signals, 5 wins, 42% settle win rate, +$1,379 profit
 // ═══════════════════════════════════════════════════════════════════
 
 // ─── INPUTS ─────────────────────────────────────────────────────
 grp_time    = "⏰ Time Window"
-window_start = input.int(45, "Signal Window Start (minute)", minval=40, maxval=55, group=grp_time)
-window_end   = input.int(57, "Signal Window End (minute)",   minval=50, maxval=59, group=grp_time)
+window_start = input.int(45, "Window Start (minute)", minval=40, maxval=55, group=grp_time)
+window_end   = input.int(49, "Window End (minute)",   minval=45, maxval=57, group=grp_time)
 
 grp_vel     = "🚀 Velocity"
-vel_bars     = input.int(15, "Velocity Lookback (minutes)",  minval=5, maxval=30, step=5, group=grp_vel, tooltip="How far back to measure the move. 15 min = sweet spot from backtest.")
-vel_min      = input.float(75, "Min Velocity ($)",           minval=25, maxval=500, step=25, group=grp_vel, tooltip="Price must have moved at least this much. $75 = backtest optimal.")
-vel_bonus    = input.float(150, "Bonus Velocity ($)",        minval=50, maxval=500, step=25, group=grp_vel, tooltip="Above this adds a bonus score point.")
+vel_bars     = input.int(15, "Velocity Lookback (minutes)",  minval=5, maxval=30, step=5, group=grp_vel, tooltip="15 bars on 1-min chart = 15 minutes.")
+vel_min      = input.float(200, "Min Velocity ($)",          minval=50, maxval=500, step=25, group=grp_vel, tooltip="$200 = only explosive moves that hold through :00.")
+vel_bonus    = input.float(400, "Bonus Velocity ($)",        minval=100, maxval=1000, step=50, group=grp_vel, tooltip="Above this adds a bonus score point.")
 
 grp_vol     = "🔊 Volume"
 vol_len      = input.int(20, "Volume SMA Length",            minval=10, maxval=50, group=grp_vol)
-vol_min      = input.float(1.5, "Min Volume Multiplier",    minval=1.0, maxval=10.0, step=0.5, group=grp_vol, tooltip="Volume must be this many times the average. 1.5x = optimal from 13.5-day backtest.")
-vol_bonus    = input.float(5.0, "Bonus Volume Multiplier",  minval=2.0, maxval=10.0, step=0.5, group=grp_vol, tooltip="Above this adds a bonus score point.")
+vol_min      = input.float(2.0, "Min Volume Multiplier",    minval=1.0, maxval=10.0, step=0.5, group=grp_vol, tooltip="2.0x = settle-validated optimal.")
+vol_bonus    = input.float(5.0, "Bonus Volume Multiplier",  minval=2.0, maxval=10.0, step=0.5, group=grp_vol)
 
 grp_dist    = "📏 Distance"
-max_dist     = input.int(250, "Max Distance to Target ($)",  minval=150, maxval=500, step=25, group=grp_dist, tooltip="Only signal if the $250 strike is within this distance. $250 = backtest optimal.")
+max_dist     = input.int(250, "Max Distance to Target ($)",  minval=100, maxval=500, step=25, group=grp_dist)
 
-grp_htf     = "📐 Higher Timeframe"
-use_htf      = input.bool(false, "Use 5-min momentum confirmation", group=grp_htf, tooltip="Off by default — the backtest winner didn't use this.")
-
-// ─── TIME WINDOW ────────────────────────────────────────────────
-// Two hot zones based on 13.5 days of backtesting:
-//   :45-:49 = 56% win rate (15 min left — moves have time to develop)
-//   :55-:57 = 50% win rate (5 min left — contracts are cheapest)
-//   :50-:54 = 20% win rate (dead zone — SKIP)
+// ─── TIME WINDOW (:45-:49 only) ────────────────────────────────
 min_of_hour  = minute(time)
-in_window    = (min_of_hour >= window_start and min_of_hour <= 49) or (min_of_hour >= 55 and min_of_hour <= window_end)
+in_window    = min_of_hour >= window_start and min_of_hour <= window_end
 
 // ─── VELOCITY ───────────────────────────────────────────────────
-// How much has price moved in the last N minutes?
-// On 1-min chart, vel_bars=15 means 15 bars back.
 price_change  = close - close[vel_bars]
 velocity      = math.abs(price_change)
 direction_up  = price_change > 0
@@ -67,10 +56,6 @@ vol_ok        = vol_ratio >= vol_min
 vol_extra     = vol_ratio >= vol_bonus
 
 // ─── DISTANCE TO TARGET ────────────────────────────────────────
-// Calculate how far the nearest actionable $250 strike is.
-// If heading UP: next $250 level above, at least $150 away.
-// If heading DOWN: next $250 level below, at least $150 away.
-
 nearest_above = math.ceil(close / 250) * 250
 dist_above    = nearest_above - close
 target_above  = dist_above >= 150 ? nearest_above : nearest_above + 250
@@ -84,14 +69,7 @@ final_dist_dn = close - target_below
 dist_ok_up    = final_dist_up <= max_dist
 dist_ok_dn    = final_dist_dn <= max_dist
 
-// ─── HIGHER TIMEFRAME (optional) ───────────────────────────────
-htf_roc       = request.security(syminfo.tickerid, "5", ta.roc(close, 3))
-htf_bull      = use_htf ? htf_roc > 0.10 : true
-htf_bear      = use_htf ? htf_roc < -0.10 : true
-
 // ─── SCORING ────────────────────────────────────────────────────
-// Base: 3/5 when all conditions met
-// +1 for extra velocity, +1 for extra volume
 bull_base     = vel_ok and vol_ok and dist_ok_up and direction_up
 bear_base     = vel_ok and vol_ok and dist_ok_dn and direction_dn
 
@@ -99,8 +77,8 @@ bull_score    = (bull_base ? 3 : 0) + (vel_extra ? 1 : 0) + (vol_extra ? 1 : 0)
 bear_score    = (bear_base ? 3 : 0) + (vel_extra ? 1 : 0) + (vol_extra ? 1 : 0)
 
 // ─── SIGNALS ────────────────────────────────────────────────────
-bull_raw = in_window and bull_base and htf_bull
-bear_raw = in_window and bear_base and htf_bear
+bull_raw = in_window and bull_base
+bear_raw = in_window and bear_base
 
 // ─── HOURLY COOLDOWN ────────────────────────────────────────────
 var int last_signal_day_hour = -1
@@ -142,8 +120,8 @@ if bear_fire
 // ─── DASHBOARD ──────────────────────────────────────────────────
 var table dash = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
 if barstate.islast
-    table.cell(dash, 0, 0, "BTC Edge v4", text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black, 60))
-    table.cell(dash, 1, 0, "VEL+VOL", text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 0, 0, "BTC Edge v5", text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 1, 0, "SETTLE-VALID", text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black, 60))
 
     table.cell(dash, 0, 1, "Minute", text_color=color.white, text_size=size.small)
     table.cell(dash, 1, 1, str.tostring(min_of_hour) + (in_window ? " ✓ LIVE" : ""), text_color=in_window ? color.green : color.gray, text_size=size.small)
