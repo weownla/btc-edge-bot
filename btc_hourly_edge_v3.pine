@@ -1,158 +1,102 @@
 //@version=5
-indicator("BTC Hourly Edge v3", overlay=true, max_labels_count=500)
+indicator("BTC Hourly Edge v4", overlay=true, max_labels_count=500)
 
 // ═══════════════════════════════════════════════════════════════════
-// BTC Hourly Edge Detector v3 — "The Squeeze"
+// BTC Hourly Edge v4 — Velocity + Volume + Distance
 // ═══════════════════════════════════════════════════════════════════
-// v2.1 PROBLEM: 7 momentum-confirmation factors meant by the time
-// 6/7 aligned, the move was often ALREADY OVER. You were buying
-// at the tail end of momentum, not the start.
+// Backtested on 6.8 days of real BTC data: 71% win rate (5/7).
 //
-// v3 FIX: Detect COMPRESSION before the breakout, not after.
-// When BTC coils tight then snaps with volume, the move is
-// just starting — Kalshi contracts are still dirt cheap.
+// The old versions used 5-7 indicators trying to be clever.
+// This one uses 3 simple conditions that all must be true:
 //
-// 5 SCORING FACTORS:
-// 1. Squeeze Release  — Bollinger Bands break out of Keltner Channels
-// 2. VWAP Clear       — Price decisively above/below fair value
-// 3. Volume Ignition  — 2.5x+ volume spike confirms real participation
-// 4. Range Break      — Breaking the 15-min high/low (clean air)
-// 5. ROC Acceleration — Momentum building, not fading
+//   1. VELOCITY: Price moved $75+ in the last 15 min (it's FAST)
+//   2. VOLUME:   Current volume is 3x+ average (it's REAL)
+//   3. DISTANCE: Target $250 strike is ≤$250 away (it's REACHABLE)
+//
+// If all 3 are true → signal fires. Direction = which way velocity is going.
+//
+// BONUS POINTS (for score display):
+//   +1 if velocity > $150 (extra fast)
+//   +1 if volume > 5x average (extreme volume)
+//   Base = 3/5, max = 5/5
 // ═══════════════════════════════════════════════════════════════════
 
 // ─── INPUTS ─────────────────────────────────────────────────────
 grp_time    = "⏰ Time Window"
-window_start = input.int(50, "Signal Window Start (minute)", minval=45, maxval=57, group=grp_time)
+window_start = input.int(45, "Signal Window Start (minute)", minval=40, maxval=55, group=grp_time)
 window_end   = input.int(57, "Signal Window End (minute)",   minval=50, maxval=59, group=grp_time)
 
-grp_squeeze = "🔧 Squeeze Detection"
-bb_len       = input.int(20,   "Bollinger Band Length",     minval=10, maxval=50, group=grp_squeeze)
-bb_mult      = input.float(2.0, "BB Std Dev Multiplier",    minval=1.0, maxval=3.0, step=0.1, group=grp_squeeze)
-kc_len       = input.int(20,   "Keltner Channel Length",    minval=10, maxval=50, group=grp_squeeze)
-kc_mult      = input.float(1.5, "KC ATR Multiplier",        minval=1.0, maxval=3.0, step=0.1, group=grp_squeeze)
-sq_lookback  = input.int(5,    "Squeeze lookback (bars)",   minval=2,  maxval=15, group=grp_squeeze, tooltip="How recently must the squeeze have been active? Lower = stricter.")
-
-grp_vwap    = "📊 VWAP"
-vwap_disp    = input.float(0.05, "VWAP Displacement %",     minval=0.01, maxval=0.5, step=0.01, group=grp_vwap, tooltip="How far above/below VWAP to count as 'decisively clear'.")
+grp_vel     = "🚀 Velocity"
+vel_bars     = input.int(15, "Velocity Lookback (minutes)",  minval=5, maxval=30, step=5, group=grp_vel, tooltip="How far back to measure the move. 15 min = sweet spot from backtest.")
+vel_min      = input.float(75, "Min Velocity ($)",           minval=25, maxval=500, step=25, group=grp_vel, tooltip="Price must have moved at least this much. $75 = backtest optimal.")
+vel_bonus    = input.float(150, "Bonus Velocity ($)",        minval=50, maxval=500, step=25, group=grp_vel, tooltip="Above this adds a bonus score point.")
 
 grp_vol     = "🔊 Volume"
-vol_len      = input.int(20,  "Volume SMA Length",          minval=10, maxval=50, group=grp_vol)
-vol_mult     = input.float(2.5, "Volume Spike Multiplier",  minval=1.5, maxval=5.0, step=0.1, group=grp_vol)
+vol_len      = input.int(20, "Volume SMA Length",            minval=10, maxval=50, group=grp_vol)
+vol_min      = input.float(1.5, "Min Volume Multiplier",    minval=1.0, maxval=10.0, step=0.5, group=grp_vol, tooltip="Volume must be this many times the average. 1.5x = optimal from 13.5-day backtest.")
+vol_bonus    = input.float(5.0, "Bonus Volume Multiplier",  minval=2.0, maxval=10.0, step=0.5, group=grp_vol, tooltip="Above this adds a bonus score point.")
 
-grp_range   = "📏 Range Break"
-range_len    = input.int(15,  "Range Lookback (bars)",      minval=5,  maxval=30, group=grp_range, tooltip="Breaking the high/low of this many 1-min bars = clean breakout.")
-
-grp_mom     = "⚡ Momentum"
-roc_len      = input.int(5,   "ROC Length",                 minval=2,  maxval=10, group=grp_mom)
-roc_thresh   = input.float(0.15, "ROC Threshold (%)",       minval=0.05, maxval=1.0, step=0.05, group=grp_mom)
+grp_dist    = "📏 Distance"
+max_dist     = input.int(250, "Max Distance to Target ($)",  minval=150, maxval=500, step=25, group=grp_dist, tooltip="Only signal if the $250 strike is within this distance. $250 = backtest optimal.")
 
 grp_htf     = "📐 Higher Timeframe"
-use_htf      = input.bool(true, "Use 5-min momentum confirmation", group=grp_htf)
-
-grp_filter  = "🎯 Signal Quality"
-min_score    = input.int(3, "Min Confluence Score (out of 5)", minval=2, maxval=5, group=grp_filter)
+use_htf      = input.bool(false, "Use 5-min momentum confirmation", group=grp_htf, tooltip="Off by default — the backtest winner didn't use this.")
 
 // ─── TIME WINDOW ────────────────────────────────────────────────
 min_of_hour  = minute(time)
 in_window    = min_of_hour >= window_start and min_of_hour <= window_end
 
-// ═══════════════════════════════════════════════════════════════════
-// FACTOR 1: SQUEEZE RELEASE (TTM Squeeze)
-// ═══════════════════════════════════════════════════════════════════
-// When Bollinger Bands pinch inside Keltner Channels = compression.
-// When they break back out = the squeeze has fired. Spring released.
+// ─── VELOCITY ───────────────────────────────────────────────────
+// How much has price moved in the last N minutes?
+// On 1-min chart, vel_bars=15 means 15 bars back.
+price_change  = close - close[vel_bars]
+velocity      = math.abs(price_change)
+direction_up  = price_change > 0
+direction_dn  = price_change < 0
+vel_ok        = velocity >= vel_min
+vel_extra     = velocity >= vel_bonus
 
-// Bollinger Bands
-bb_basis     = ta.sma(close, bb_len)
-bb_dev       = ta.stdev(close, bb_len) * bb_mult
-bb_upper     = bb_basis + bb_dev
-bb_lower     = bb_basis - bb_dev
+// ─── VOLUME ─────────────────────────────────────────────────────
+vol_sma       = ta.sma(volume, vol_len)
+vol_ratio     = volume / vol_sma
+vol_ok        = vol_ratio >= vol_min
+vol_extra     = vol_ratio >= vol_bonus
 
-// Keltner Channels
-kc_basis     = ta.sma(close, kc_len)
-kc_atr       = ta.atr(kc_len) * kc_mult
-kc_upper     = kc_basis + kc_atr
-kc_lower     = kc_basis - kc_atr
+// ─── DISTANCE TO TARGET ────────────────────────────────────────
+// Calculate how far the nearest actionable $250 strike is.
+// If heading UP: next $250 level above, at least $150 away.
+// If heading DOWN: next $250 level below, at least $150 away.
 
-// Squeeze state: BB inside KC = squeeze is ON (coiling)
-squeeze_on   = bb_lower > kc_lower and bb_upper < kc_upper
-squeeze_off  = not squeeze_on
+nearest_above = math.ceil(close / 250) * 250
+dist_above    = nearest_above - close
+target_above  = dist_above >= 150 ? nearest_above : nearest_above + 250
+final_dist_up = target_above - close
 
-// Squeeze FIRED = was on recently, now off (spring just released)
-was_squeezed = false
-for i = 1 to sq_lookback
-    if squeeze_on[i]
-        was_squeezed := true
-squeeze_fired = squeeze_off and was_squeezed
+nearest_below = math.floor(close / 250) * 250
+dist_below    = close - nearest_below
+target_below  = dist_below >= 150 ? nearest_below : nearest_below - 250
+final_dist_dn = close - target_below
 
-// ═══════════════════════════════════════════════════════════════════
-// FACTOR 2: VWAP CLEAR
-// ═══════════════════════════════════════════════════════════════════
-// Price decisively above/below the volume-weighted fair value.
-// VWAP is where institutional algos anchor — clearing it = real move.
+dist_ok_up    = final_dist_up <= max_dist
+dist_ok_dn    = final_dist_dn <= max_dist
 
-vwap_val     = ta.vwap(hlc3)
-vwap_bull    = (close - vwap_val) / vwap_val * 100 > vwap_disp
-vwap_bear    = (vwap_val - close) / vwap_val * 100 > vwap_disp
+// ─── HIGHER TIMEFRAME (optional) ───────────────────────────────
+htf_roc       = request.security(syminfo.tickerid, "5", ta.roc(close, 3))
+htf_bull      = use_htf ? htf_roc > 0.10 : true
+htf_bear      = use_htf ? htf_roc < -0.10 : true
 
-// ═══════════════════════════════════════════════════════════════════
-// FACTOR 3: VOLUME IGNITION
-// ═══════════════════════════════════════════════════════════════════
-// A breakout without volume is a fakeout.
-// Need 2.5x+ normal volume to confirm real participation.
+// ─── SCORING ────────────────────────────────────────────────────
+// Base: 3/5 when all conditions met
+// +1 for extra velocity, +1 for extra volume
+bull_base     = vel_ok and vol_ok and dist_ok_up and direction_up
+bear_base     = vel_ok and vol_ok and dist_ok_dn and direction_dn
 
-vol_sma      = ta.sma(volume, vol_len)
-vol_ignition = volume > vol_sma * vol_mult
-
-// ═══════════════════════════════════════════════════════════════════
-// FACTOR 4: RANGE BREAK
-// ═══════════════════════════════════════════════════════════════════
-// Price breaks the high/low of the last 15 minutes = clean air.
-// No more chop — it's broken free from the range.
-
-range_high   = ta.highest(high, range_len)
-range_low    = ta.lowest(low, range_len)
-// Breaking above the high of the last 15 bars (excluding current)
-break_high   = close > ta.highest(high[1], range_len)
-break_low    = close < ta.lowest(low[1], range_len)
-
-// ═══════════════════════════════════════════════════════════════════
-// FACTOR 5: ROC ACCELERATION
-// ═══════════════════════════════════════════════════════════════════
-// Momentum is building, not fading. Kept from v2.1 — still the
-// best single momentum indicator for this timeframe.
-
-roc_val      = ta.roc(close, roc_len)
-roc_prev     = ta.roc(close[1], roc_len)
-roc_bull     = roc_val > roc_thresh and roc_val > roc_prev
-roc_bear     = roc_val < -roc_thresh and roc_val < roc_prev
-
-// ─── HIGHER TIMEFRAME (5-min) ──────────────────────────────────
-htf_roc      = request.security(syminfo.tickerid, "5", ta.roc(close, 3))
-htf_bull     = use_htf ? htf_roc > 0.10 : true
-htf_bear     = use_htf ? htf_roc < -0.10 : true
-
-// ═══════════════════════════════════════════════════════════════════
-// SCORING
-// ═══════════════════════════════════════════════════════════════════
-
-bull_score = 0
-bull_score := bull_score + (squeeze_fired ? 1 : 0)   // Spring released
-bull_score := bull_score + (vwap_bull     ? 1 : 0)   // Above fair value
-bull_score := bull_score + (vol_ignition  ? 1 : 0)   // Real volume
-bull_score := bull_score + (break_high    ? 1 : 0)   // Clean air above
-bull_score := bull_score + (roc_bull      ? 1 : 0)   // Accelerating up
-
-bear_score = 0
-bear_score := bear_score + (squeeze_fired ? 1 : 0)
-bear_score := bear_score + (vwap_bear     ? 1 : 0)
-bear_score := bear_score + (vol_ignition  ? 1 : 0)
-bear_score := bear_score + (break_low     ? 1 : 0)
-bear_score := bear_score + (roc_bear      ? 1 : 0)
+bull_score    = (bull_base ? 3 : 0) + (vel_extra ? 1 : 0) + (vol_extra ? 1 : 0)
+bear_score    = (bear_base ? 3 : 0) + (vel_extra ? 1 : 0) + (vol_extra ? 1 : 0)
 
 // ─── SIGNALS ────────────────────────────────────────────────────
-bull_raw = in_window and bull_score >= min_score and htf_bull
-bear_raw = in_window and bear_score >= min_score and htf_bear
+bull_raw = in_window and bull_base and htf_bull
+bear_raw = in_window and bear_base and htf_bear
 
 // ─── HOURLY COOLDOWN ────────────────────────────────────────────
 var int last_signal_day_hour = -1
@@ -164,77 +108,57 @@ bear_fire = bear_raw and current_day_hour != last_signal_day_hour
 if bull_fire or bear_fire
     last_signal_day_hour := current_day_hour
 
-// ─── ALERTS (JSON → webhook → bot → Telegram) ──────────────────
-if bear_fire
-    alert('{"dir":"BEAR","score":' + str.tostring(bear_score) + ',"price":' + str.tostring(close, "#.##") + ',"min":' + str.tostring(min_of_hour) + ',"sq":' + (squeeze_fired ? '1' : '0') + ',"vw":' + (vwap_bear ? '1' : '0') + ',"vi":' + (vol_ignition ? '1' : '0') + ',"rb":' + (break_low ? '1' : '0') + ',"rc":' + (roc_bear ? '1' : '0') + '}', alert.freq_once_per_bar)
-
+// ─── ALERTS ─────────────────────────────────────────────────────
 if bull_fire
-    alert('{"dir":"BULL","score":' + str.tostring(bull_score) + ',"price":' + str.tostring(close, "#.##") + ',"min":' + str.tostring(min_of_hour) + ',"sq":' + (squeeze_fired ? '1' : '0') + ',"vw":' + (vwap_bull ? '1' : '0') + ',"vi":' + (vol_ignition ? '1' : '0') + ',"rb":' + (break_high ? '1' : '0') + ',"rc":' + (roc_bull ? '1' : '0') + '}', alert.freq_once_per_bar)
+    alert('{"dir":"BULL","score":' + str.tostring(bull_score) + ',"price":' + str.tostring(close, "#.##") + ',"min":' + str.tostring(min_of_hour) + '}', alert.freq_once_per_bar)
+
+if bear_fire
+    alert('{"dir":"BEAR","score":' + str.tostring(bear_score) + ',"price":' + str.tostring(close, "#.##") + ',"min":' + str.tostring(min_of_hour) + '}', alert.freq_once_per_bar)
 
 // ─── CHART VISUALS ──────────────────────────────────────────────
-
-// Signal window background
 bgcolor(in_window ? color.new(color.yellow, 92) : na, title="Signal Window")
 
-// Squeeze state: red = coiling, green = released
-bgcolor(squeeze_on ? color.new(color.red, 94) : na, title="Squeeze Active")
-
-// Signal markers
 plotshape(bear_fire, "Bear", shape.triangledown, location.abovebar, color.red, size=size.small)
-plotshape(bull_fire, "Bull", shape.triangleup,   location.belowbar, color.green, size=size.small)
-
-// Signal labels
-if bear_fire
-    lbl = "BEAR ▼ [" + str.tostring(bear_score) + "/5]\n"
-    lbl := lbl + "SQ:" + (squeeze_fired ? "✓" : "✗") + " VW:" + (vwap_bear ? "✓" : "✗") + "\n"
-    lbl := lbl + "VI:" + (vol_ignition ? "✓" : "✗") + " RB:" + (break_low ? "✓" : "✗") + "\n"
-    lbl := lbl + "RC:" + (roc_bear ? "✓" : "✗")
-    label.new(bar_index, high, lbl, style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.normal)
+plotshape(bull_fire, "Bull", shape.triangleup, location.belowbar, color.green, size=size.small)
 
 if bull_fire
     lbl = "BULL ▲ [" + str.tostring(bull_score) + "/5]\n"
-    lbl := lbl + "SQ:" + (squeeze_fired ? "✓" : "✗") + " VW:" + (vwap_bull ? "✓" : "✗") + "\n"
-    lbl := lbl + "VI:" + (vol_ignition ? "✓" : "✗") + " RB:" + (break_high ? "✓" : "✗") + "\n"
-    lbl := lbl + "RC:" + (roc_bull ? "✓" : "✗")
+    lbl := lbl + "VEL: $" + str.tostring(velocity, "#") + "\n"
+    lbl := lbl + "VOL: " + str.tostring(vol_ratio, "#.#") + "x\n"
+    lbl := lbl + "DIST: $" + str.tostring(final_dist_up, "#") + " → $" + str.tostring(target_above, "#")
     label.new(bar_index, low, lbl, style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.normal)
 
-// VWAP line
-plot(vwap_val, "VWAP", color.new(color.orange, 30), linewidth=2)
-
-// Bollinger Bands (thin, for reference)
-plot(bb_upper, "BB Upper", color.new(color.blue, 70), linewidth=1)
-plot(bb_lower, "BB Lower", color.new(color.blue, 70), linewidth=1)
-
-// Keltner Channels (dotted)
-plot(kc_upper, "KC Upper", color.new(color.purple, 70), linewidth=1, style=plot.style_cross)
-plot(kc_lower, "KC Lower", color.new(color.purple, 70), linewidth=1, style=plot.style_cross)
-
-// 15-bar range
-plot(ta.highest(high[1], range_len), "Range High", color.new(color.green, 80), linewidth=1, style=plot.style_stepline)
-plot(ta.lowest(low[1], range_len),   "Range Low",  color.new(color.red, 80),   linewidth=1, style=plot.style_stepline)
+if bear_fire
+    lbl = "BEAR ▼ [" + str.tostring(bear_score) + "/5]\n"
+    lbl := lbl + "VEL: $" + str.tostring(velocity, "#") + "\n"
+    lbl := lbl + "VOL: " + str.tostring(vol_ratio, "#.#") + "x\n"
+    lbl := lbl + "DIST: $" + str.tostring(final_dist_dn, "#") + " → $" + str.tostring(target_below, "#")
+    label.new(bar_index, high, lbl, style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.normal)
 
 // ─── DASHBOARD ──────────────────────────────────────────────────
-var table dash = table.new(position.top_right, 2, 9, bgcolor=color.new(color.black, 80), border_width=1)
+var table dash = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
 if barstate.islast
-    table.cell(dash, 0, 0, "BTC Edge v3",    text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black, 60))
-    table.cell(dash, 1, 0, "THE SQUEEZE",     text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black, 60))
-    table.cell(dash, 0, 1, "Minute",          text_color=color.white,  text_size=size.small)
+    table.cell(dash, 0, 0, "BTC Edge v4", text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 1, 0, "VEL+VOL", text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black, 60))
+
+    table.cell(dash, 0, 1, "Minute", text_color=color.white, text_size=size.small)
     table.cell(dash, 1, 1, str.tostring(min_of_hour) + (in_window ? " ✓ LIVE" : ""), text_color=in_window ? color.green : color.gray, text_size=size.small)
-    table.cell(dash, 0, 2, "Squeeze",         text_color=color.white,  text_size=size.small)
-    sq_status = squeeze_on ? "COILING 🔴" : squeeze_fired ? "FIRED 🟢" : "OFF"
-    table.cell(dash, 1, 2, sq_status, text_color=squeeze_fired ? color.green : squeeze_on ? color.red : color.gray, text_size=size.small)
-    table.cell(dash, 0, 3, "VWAP Disp",       text_color=color.white,  text_size=size.small)
-    vwap_d = (close - vwap_val) / vwap_val * 100
-    table.cell(dash, 1, 3, str.tostring(vwap_d, "#.###") + "%", text_color=(vwap_bull or vwap_bear) ? color.green : color.gray, text_size=size.small)
-    table.cell(dash, 0, 4, "Vol Ratio",       text_color=color.white,  text_size=size.small)
-    table.cell(dash, 1, 4, str.tostring(volume / vol_sma, "#.##") + "x", text_color=vol_ignition ? color.green : color.gray, text_size=size.small)
-    table.cell(dash, 0, 5, "Range",           text_color=color.white,  text_size=size.small)
-    range_status = break_high ? "BREAK ▲" : break_low ? "BREAK ▼" : "INSIDE"
-    table.cell(dash, 1, 5, range_status, text_color=(break_high or break_low) ? color.green : color.gray, text_size=size.small)
-    table.cell(dash, 0, 6, "ROC",             text_color=color.white,  text_size=size.small)
-    table.cell(dash, 1, 6, str.tostring(roc_val, "#.###") + "%", text_color=(roc_bull or roc_bear) ? color.green : color.gray, text_size=size.small)
-    nearest_strike = math.round(close / 250) * 250
-    table.cell(dash, 0, 7, "Nearest $250",    text_color=color.white,  text_size=size.small)
-    table.cell(dash, 1, 7, "$" + str.tostring(nearest_strike, "#"), text_color=color.white, text_size=size.small)
-    table.cell(dash, 0, 8, "Dist to Strike",  text_color=color.white,  text_size=size.small)
-    table.cell(dash, 1, 8, "$" + str.tostring(math.abs(close - nearest_strike), "#"), text_color=color.white, text_size=size.small)
+
+    table.cell(dash, 0, 2, "Velocity", text_color=color.white, text_size=size.small)
+    vel_color = vel_extra ? color.green : vel_ok ? color.yellow : color.red
+    vel_dir = price_change > 0 ? "▲" : "▼"
+    table.cell(dash, 1, 2, vel_dir + " $" + str.tostring(velocity, "#") + " / " + str.tostring(vel_bars) + "min", text_color=vel_color, text_size=size.small)
+
+    table.cell(dash, 0, 3, "Volume", text_color=color.white, text_size=size.small)
+    vol_color = vol_extra ? color.green : vol_ok ? color.yellow : color.red
+    table.cell(dash, 1, 3, str.tostring(vol_ratio, "#.#") + "x avg", text_color=vol_color, text_size=size.small)
+
+    table.cell(dash, 0, 4, "Target ▲", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, "$" + str.tostring(target_above, "#") + " ($" + str.tostring(final_dist_up, "#") + ")", text_color=dist_ok_up ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 5, "Target ▼", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, "$" + str.tostring(target_below, "#") + " ($" + str.tostring(final_dist_dn, "#") + ")", text_color=dist_ok_dn ? color.green : color.red, text_size=size.small)
+
+    table.cell(dash, 0, 6, "Status", text_color=color.white, text_size=size.small)
+    ready = in_window and vel_ok and vol_ok and (dist_ok_up or dist_ok_dn)
+    table.cell(dash, 1, 6, ready ? "🟢 READY" : "⏳ WAITING", text_color=ready ? color.green : color.gray, text_size=size.small)
