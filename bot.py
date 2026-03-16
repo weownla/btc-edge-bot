@@ -178,76 +178,64 @@ def kalshi_post(path, data):
 def find_btc_hourly_market(direction, target_price):
     """
     Find the Kalshi BTC hourly market matching our signal.
-    
-    Kalshi BTC hourly market structure:
-      Event ticker: KXBTCD-{YY}{MON}{DD}{HH} (e.g., KXBTCD-26MAR1604 for 4PM on Mar 16)
-      Market ticker: {EVENT}-T{STRIKE} (e.g., KXBTCD-26MAR1604-T72750)
-    
-    Strategy:
-      1. Get all open KXBTCD markets
-      2. Filter to ones closing in the next hour
-      3. Find the strike closest to our target
-      4. Return ticker, contract price, and side
+    Merged approach: tries multiple series tickers, multiple price fields,
+    and logs everything for debugging.
     """
     try:
-        # Step 1: Get all open BTC hourly markets
-        series = KALSHI_SERIES_TICKER
-        path = f"/markets?status=open&series_ticker={series}&limit=200"
-        data = kalshi_get(path)
+        # Step 1: Try multiple series tickers until one returns markets
+        series_to_try = [KALSHI_SERIES_TICKER, "KXBTCD", "KXBTC", "KXBTCUSD"]
+        # Remove duplicates while preserving order
+        seen = set()
+        series_to_try = [s for s in series_to_try if not (s in seen or seen.add(s))]
         
-        if not data or 'markets' not in data or len(data['markets']) == 0:
-            # Try without series filter
-            path = "/markets?status=open&limit=200"
+        markets = []
+        used_series = ""
+        for series in series_to_try:
+            path = f"/markets?status=open&series_ticker={series}&limit=200"
             data = kalshi_get(path)
-            if data and 'markets' in data:
-                data['markets'] = [m for m in data['markets']
-                                   if series.lower() in m.get('ticker', '').lower()]
+            if data and 'markets' in data and len(data['markets']) > 0:
+                markets = data['markets']
+                used_series = series
+                logger.info(f"Found {len(markets)} markets with series={series}")
+                break
         
-        if not data or 'markets' not in data or len(data['markets']) == 0:
-            logger.error(f"No markets found for series {series}")
+        if not markets:
+            logger.error(f"No markets found for any series: {series_to_try}")
             return None, None, None
         
-        markets = data['markets']
-        logger.info(f"Found {len(markets)} open {series} markets")
-        
-        # Step 2: Find the market with the strike closest to our target
-        # Among markets closing soonest (the current hour)
+        # Step 2: Find strike closest to our target
+        target_rounded = round(target_price / 250) * 250
         best_market = None
         best_diff = float('inf')
         
-        # Round target to nearest $250 (Kalshi uses $250 strikes)
-        target_rounded = round(target_price / 250) * 250
-        
         for m in markets:
             ticker = m.get('ticker', '')
-            
-            # Try to extract strike from ticker (format: ...-T{STRIKE})
             strike = 0
-            if '-T' in ticker:
+            
+            # Priority 1: API strike fields
+            strike = m.get('floor_strike', 0) or m.get('cap_strike', 0) or m.get('strike_price', 0) or 0
+            
+            # Kalshi may store strikes in cents (7375000 = $73,750)
+            if strike > 1000000:
+                strike = strike / 100
+            
+            # Priority 2: Parse from ticker (format: ...-T73750)
+            if strike == 0 and '-T' in ticker:
                 try:
                     strike_str = ticker.split('-T')[-1]
                     strike = float(strike_str)
-                except ValueError:
+                except (ValueError, IndexError):
                     pass
             
-            # Also check the strike fields
+            # Priority 3: Parse from title/subtitle
             if strike == 0:
-                strike = m.get('floor_strike', 0) or m.get('strike_price', 0) or 0
-                # Kalshi sometimes stores as cents
-                if strike > 1000000:
-                    strike = strike / 100
+                text = (m.get('title', '') + ' ' + m.get('subtitle', '')).upper()
+                match = re.search(r'\$(\d{1,3}(?:,\d{3})*)', text)
+                if match:
+                    strike = float(match.group(1).replace(',', ''))
             
-            if strike == 0:
-                # Try parsing from subtitle/title
-                title = m.get('title', '') + ' ' + m.get('subtitle', '')
-                nums = re.findall(r'\$?([\d,]+)', title)
-                for n in nums:
-                    val = int(n.replace(',', ''))
-                    if 50000 < val < 200000:
-                        strike = val
-                        break
-            
-            if strike == 0:
+            # Must be in BTC range
+            if not (50000 <= strike <= 200000):
                 continue
             
             diff = abs(strike - target_rounded)
@@ -256,44 +244,65 @@ def find_btc_hourly_market(direction, target_price):
                 best_market = m
         
         if not best_market:
-            logger.error(f"No market found near strike ${target_rounded:,}")
+            logger.error(f"No market found near ${target_rounded:,} in {len(markets)} markets")
+            # Log first 3 markets for debugging
+            for m in markets[:3]:
+                logger.error(f"  Sample market: {m.get('ticker')} | floor_strike={m.get('floor_strike')} | title={m.get('title','')[:60]}")
             return None, None, None
         
         ticker = best_market['ticker']
         
-        # Step 3: Determine side and price
-        # For BEAR: buy NO (betting price drops below strike)
-        # For BULL: buy YES (betting price stays above / goes above strike)
+        # Step 3: Get contract price — try EVERY possible field
+        def parse_dollars(val):
+            """Convert '0.0500' to 5 (cents)."""
+            if not val: return 0
+            try: return int(round(float(val) * 100))
+            except: return 0
         
-        # Get prices - try multiple field names Kalshi might use
-        yes_ask = best_market.get('yes_ask', 0) or best_market.get('last_price', 0) or 0
-        no_ask = best_market.get('no_ask', 0) or 0
+        # Method A: Dollar string fields (Kalshi v2 API standard)
+        yes_ask = parse_dollars(best_market.get('yes_ask_dollars'))
+        no_ask = parse_dollars(best_market.get('no_ask_dollars'))
         
-        # If no_ask is 0, calculate from yes_ask (yes + no = 100)
+        # Method B: Integer cent fields (some API versions)
+        if yes_ask == 0:
+            yes_ask = best_market.get('yes_ask', 0) or 0
+        if no_ask == 0:
+            no_ask = best_market.get('no_ask', 0) or 0
+        
+        # Method C: Last price as fallback
+        if yes_ask == 0 and no_ask == 0:
+            last = parse_dollars(best_market.get('last_price_dollars'))
+            if last > 0:
+                yes_ask = last
+                no_ask = 100 - last
+        
+        # Method D: Calculate missing side
         if no_ask == 0 and yes_ask > 0:
             no_ask = 100 - yes_ask
         if yes_ask == 0 and no_ask > 0:
             yes_ask = 100 - no_ask
         
+        # Full debug log
+        logger.info(f"MATCH: {ticker} | strike_diff=${best_diff:,.0f}")
+        logger.info(f"  floor_strike={best_market.get('floor_strike')} cap_strike={best_market.get('cap_strike')}")
+        logger.info(f"  yes_ask_dollars={best_market.get('yes_ask_dollars')} no_ask_dollars={best_market.get('no_ask_dollars')}")
+        logger.info(f"  yes_ask={best_market.get('yes_ask')} no_ask={best_market.get('no_ask')}")
+        logger.info(f"  last_price_dollars={best_market.get('last_price_dollars')}")
+        logger.info(f"  PARSED: yes={yes_ask}¢ no={no_ask}¢")
+        
         if direction == "BEAR":
-            side = "no"
-            contract_price = no_ask
+            side, contract_price = "no", no_ask
         else:
-            side = "yes"
-            contract_price = yes_ask
+            side, contract_price = "yes", yes_ask
         
-        logger.info(f"Selected: {ticker} | Strike: ${best_market.get('floor_strike', '?')} | "
-                    f"{side}={contract_price}¢ | Target was ${target_rounded:,}")
-        
+        logger.info(f"  DECISION: {direction} → {side}@{contract_price}¢")
         return ticker, contract_price, side
-
+    
     except Exception as e:
         logger.error(f"Market search error: {e}")
         import traceback
         logger.error(traceback.format_exc())
-
-    return None, None, None
-
+    
     return None, None, None
 
 
@@ -627,6 +636,38 @@ def start_trading():
     kill_switch = False
     send_telegram("🟢 <b>Auto-trading re-enabled.</b>")
     return jsonify({"status": "started"})
+
+
+@app.route("/markets", methods=["GET"])
+def debug_markets():
+    """Debug: show what Kalshi returns for BTC markets."""
+    if not check_auth(request):
+        return jsonify({"error": "unauthorized"}), 401
+    
+    results = {}
+    for series in [KALSHI_SERIES_TICKER, "KXBTCD", "KXBTC"]:
+        path = f"/markets?status=open&series_ticker={series}&limit=5"
+        data = kalshi_get(path)
+        if data and 'markets' in data:
+            results[series] = []
+            for m in data['markets'][:3]:
+                results[series].append({
+                    "ticker": m.get('ticker'),
+                    "title": m.get('title', '')[:80],
+                    "floor_strike": m.get('floor_strike'),
+                    "cap_strike": m.get('cap_strike'),
+                    "yes_ask": m.get('yes_ask'),
+                    "no_ask": m.get('no_ask'),
+                    "yes_ask_dollars": m.get('yes_ask_dollars'),
+                    "no_ask_dollars": m.get('no_ask_dollars'),
+                    "last_price_dollars": m.get('last_price_dollars'),
+                    "status": m.get('status'),
+                    "close_time": m.get('close_time'),
+                })
+        else:
+            results[series] = "no markets found"
+    
+    return jsonify(results)
 
 
 @app.route("/health", methods=["GET"])
