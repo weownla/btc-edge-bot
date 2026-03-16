@@ -220,20 +220,18 @@ def find_btc_hourly_market(direction, target_price):
         
         for hh in hours_to_try:
             event_ticker = f"KXBTCD-{yy}{mon}{dd}{hh:02d}"
-            path = f"/events/{event_ticker}"
+            
+            # Query markets filtered by event ticker (not /events/ which returns empty)
+            path = f"/markets?event_ticker={event_ticker}&status=open&limit=100"
             data = kalshi_get(path)
             
-            if data and 'event' in data and 'markets' in data['event']:
-                mkts = data['event']['markets']
-                if len(mkts) > 0:
-                    markets = mkts
-                    used_event = event_ticker
-                    logger.info(f"Found {len(markets)} strikes in event {event_ticker}")
-                    break
-                else:
-                    logger.info(f"Event {event_ticker} exists but has 0 markets")
+            if data and 'markets' in data and len(data['markets']) > 0:
+                markets = data['markets']
+                used_event = event_ticker
+                logger.info(f"Found {len(markets)} strikes in event {event_ticker}")
+                break
             else:
-                logger.info(f"Event {event_ticker} not found, trying next")
+                logger.info(f"Event {event_ticker}: no markets via /markets?event_ticker, trying next")
         
         # Fallback: try previous day's late hours if we're in early morning
         if not markets and et_now.hour < 4:
@@ -241,14 +239,12 @@ def find_btc_hourly_market(direction, target_price):
             dd_prev = f"{prev_day.day:02d}"
             for hh in [23, 22, 21]:
                 event_ticker = f"KXBTCD-{yy}{mon}{dd_prev}{hh:02d}"
-                data = kalshi_get(f"/events/{event_ticker}")
-                if data and 'event' in data and 'markets' in data['event']:
-                    mkts = data['event']['markets']
-                    if len(mkts) > 0:
-                        markets = mkts
-                        used_event = event_ticker
-                        logger.info(f"Found {len(markets)} strikes in fallback event {event_ticker}")
-                        break
+                data = kalshi_get(f"/markets?event_ticker={event_ticker}&status=open&limit=100")
+                if data and 'markets' in data and len(data['markets']) > 0:
+                    markets = data['markets']
+                    used_event = event_ticker
+                    logger.info(f"Found {len(markets)} strikes in fallback event {event_ticker}")
+                    break
         
         if not markets:
             logger.error(f"No hourly event found for ET hour {et_now.hour} on {et_now.date()}")
@@ -701,13 +697,12 @@ def debug_markets():
         for hh in [et_now.hour, et_now.hour + 1, et_now.hour - 1]:
             if hh < 0 or hh > 23: continue
             event_ticker = f"KXBTCD-{yy}{mon}{dd}{hh:02d}"
-            path = f"/events/{event_ticker}"
+            path = f"/markets?event_ticker={event_ticker}&status=open&limit=10"
             data = kalshi_get(path)
             
-            if data and 'event' in data:
-                mkts = data['event'].get('markets', [])
+            if data and 'markets' in data:
+                mkts = data['markets']
                 results[event_ticker] = {
-                    "title": data['event'].get('title', ''),
                     "market_count": len(mkts),
                     "sample_markets": []
                 }
