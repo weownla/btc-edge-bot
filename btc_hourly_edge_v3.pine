@@ -43,8 +43,12 @@ grp_htf     = "📐 Higher Timeframe"
 use_htf      = input.bool(false, "Use 5-min momentum confirmation", group=grp_htf, tooltip="Off by default — the backtest winner didn't use this.")
 
 // ─── TIME WINDOW ────────────────────────────────────────────────
+// Two hot zones based on 13.5 days of backtesting:
+//   :45-:49 = 56% win rate (15 min left — moves have time to develop)
+//   :55-:57 = 50% win rate (5 min left — contracts are cheapest)
+//   :50-:54 = 20% win rate (dead zone — SKIP)
 min_of_hour  = minute(time)
-in_window    = min_of_hour >= window_start and min_of_hour <= window_end
+in_window    = (min_of_hour >= window_start and min_of_hour <= 49) or (min_of_hour >= 55 and min_of_hour <= window_end)
 
 // ─── VELOCITY ───────────────────────────────────────────────────
 // How much has price moved in the last N minutes?
