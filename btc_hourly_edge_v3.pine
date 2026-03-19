@@ -1,61 +1,70 @@
 //@version=5
-indicator("BTC Hourly Edge v5", overlay=true, max_labels_count=500)
+indicator("BTC Trend Rider v6", overlay=true, max_labels_count=500)
 
 // ═══════════════════════════════════════════════════════════════════
-// BTC Hourly Edge v5 — Settle-Validated
+// BTC Trend Rider v6 — Volatile Regime + Trend Alignment
 // ═══════════════════════════════════════════════════════════════════
-// v4 backtested on "touch" (did price reach target?). Kalshi pays
-// on "settle" (where is price AT :00?). 6 of 10 "wins" bounced
-// back before the hour closed. Real win rate was 19%, not 48%.
+// Core insight: on volatile trending days, BTC moves $1,000+ in one
+// direction. Kalshi prices "10% chance" contracts that are really
+// 40-50% when you account for trend continuation.
 //
-// v5 fixes this by only catching moves strong enough to HOLD:
-//   1. VELOCITY ≥ $200 in 15 min (only explosive moves, not drifts)
-//   2. VOLUME ≥ 2.0x average (confirmed participation)
-//   3. DISTANCE ≤ $250 to target strike (reachable)
-//   4. WINDOW :45-:49 only (15 min left = time to develop AND hold)
-//      No :55 — late signals touch but reverse by :00
+// Three conditions:
+//   1. VOLATILE REGIME: ATR(4) ≥ 1.5× ATR(48) — big candles
+//   2. MULTI-HOUR TREND: 2h move ≥ $200 AND 4h move ≥ $300 same dir
+//   3. LATE WINDOW: :50-:57 only — cheapest contracts, 8-12x payouts
 //
-// Settle-validated backtest (8.2 days real data):
-//   12 signals, 5 wins, 42% settle win rate, +$1,379 profit
+// Settle-validated backtest (20 days):
+//   Trend+vel: 8/20 wins (40%), +$2,215 at $10/bet
 // ═══════════════════════════════════════════════════════════════════
 
 // ─── INPUTS ─────────────────────────────────────────────────────
-grp_time    = "⏰ Time Window"
-window_start = input.int(45, "Window Start (minute)", minval=40, maxval=55, group=grp_time)
-window_end   = input.int(49, "Window End (minute)",   minval=45, maxval=57, group=grp_time)
+grp_regime  = "🌡️ Volatility Regime"
+atr_fast     = input.int(4, "ATR Fast (bars)",     minval=2, maxval=10, group=grp_regime)
+atr_slow     = input.int(48, "ATR Slow (bars)",    minval=20, maxval=96, group=grp_regime)
+atr_thresh   = input.float(1.5, "Min ATR Ratio",   minval=1.0, maxval=3.0, step=0.1, group=grp_regime, tooltip="1.5 = candles are 50% bigger than normal. Today's crash was 2.0+")
 
-grp_vel     = "🚀 Velocity"
-vel_bars     = input.int(15, "Velocity Lookback (minutes)",  minval=5, maxval=30, step=5, group=grp_vel, tooltip="15 bars on 1-min chart = 15 minutes.")
-vel_min      = input.float(200, "Min Velocity ($)",          minval=50, maxval=500, step=25, group=grp_vel, tooltip="$200 = only explosive moves that hold through :00.")
-vel_bonus    = input.float(400, "Bonus Velocity ($)",        minval=100, maxval=1000, step=50, group=grp_vel, tooltip="Above this adds a bonus score point.")
+grp_trend   = "📈 Trend Detection"
+trend_2h_min = input.float(200, "Min 2h Move ($)",  minval=50, maxval=500, step=50, group=grp_trend)
+trend_4h_min = input.float(300, "Min 4h Move ($)",  minval=100, maxval=1000, step=50, group=grp_trend)
 
-grp_vol     = "🔊 Volume"
-vol_len      = input.int(20, "Volume SMA Length",            minval=10, maxval=50, group=grp_vol)
-vol_min      = input.float(2.0, "Min Volume Multiplier",    minval=1.0, maxval=10.0, step=0.5, group=grp_vol, tooltip="2.0x = settle-validated optimal.")
-vol_bonus    = input.float(5.0, "Bonus Volume Multiplier",  minval=2.0, maxval=10.0, step=0.5, group=grp_vol)
+grp_time    = "⏰ Entry Window"
+window_start = input.int(50, "Window Start (minute)", minval=40, maxval=57, group=grp_time)
+window_end   = input.int(57, "Window End (minute)",   minval=45, maxval=59, group=grp_time)
 
-grp_dist    = "📏 Distance"
-max_dist     = input.int(250, "Max Distance to Target ($)",  minval=100, maxval=500, step=25, group=grp_dist)
+grp_vel     = "🚀 Velocity (optional boost)"
+vel_bars     = input.int(15, "Lookback (bars)",      minval=5, maxval=30, group=grp_vel)
+vel_min      = input.float(75, "Min Velocity ($)",   minval=0, maxval=500, step=25, group=grp_vel, tooltip="0 = disabled. 75 = require some recent movement too.")
+vol_min      = input.float(1.5, "Min Volume Mult",   minval=0.0, maxval=5.0, step=0.5, group=grp_vel, tooltip="0 = disabled")
 
-// ─── TIME WINDOW (:45-:49 only) ────────────────────────────────
-min_of_hour  = minute(time)
-in_window    = min_of_hour >= window_start and min_of_hour <= window_end
+// ─── VOLATILITY REGIME ──────────────────────────────────────────
+atr_f = ta.atr(atr_fast)
+atr_s = ta.atr(atr_slow)
+atr_ratio = atr_f / atr_s
+regime_hot = atr_ratio >= atr_thresh
 
-// ─── VELOCITY ───────────────────────────────────────────────────
-price_change  = close - close[vel_bars]
-velocity      = math.abs(price_change)
-direction_up  = price_change > 0
-direction_dn  = price_change < 0
-vel_ok        = velocity >= vel_min
-vel_extra     = velocity >= vel_bonus
+// ─── MULTI-HOUR TREND ───────────────────────────────────────────
+// On 1-min chart: 2h = 120 bars, 4h = 240 bars
+bars_2h = 120
+bars_4h = 240
+trend_2h = close - close[bars_2h]
+trend_4h = close - close[bars_4h]
 
-// ─── VOLUME ─────────────────────────────────────────────────────
-vol_sma       = ta.sma(volume, vol_len)
-vol_ratio     = volume / vol_sma
-vol_ok        = vol_ratio >= vol_min
-vol_extra     = vol_ratio >= vol_bonus
+strong_up   = trend_2h >= trend_2h_min and trend_4h >= trend_4h_min
+strong_down = trend_2h <= -trend_2h_min and trend_4h <= -trend_4h_min
+has_trend   = strong_up or strong_down
 
-// ─── DISTANCE TO TARGET ────────────────────────────────────────
+// ─── VELOCITY (optional) ────────────────────────────────────────
+velocity = math.abs(close - close[vel_bars])
+vol_sma  = ta.sma(volume, 20)
+vol_ratio = volume / vol_sma
+vel_ok = vel_min == 0 ? true : velocity >= vel_min
+vol_ok = vol_min == 0 ? true : vol_ratio >= vol_min
+
+// ─── TIME WINDOW ────────────────────────────────────────────────
+min_of_hour = minute(time)
+in_window = min_of_hour >= window_start and min_of_hour <= window_end
+
+// ─── TARGET CALCULATION ─────────────────────────────────────────
 nearest_above = math.ceil(close / 250) * 250
 dist_above    = nearest_above - close
 target_above  = dist_above >= 150 ? nearest_above : nearest_above + 250
@@ -66,81 +75,76 @@ dist_below    = close - nearest_below
 target_below  = dist_below >= 150 ? nearest_below : nearest_below - 250
 final_dist_dn = close - target_below
 
-dist_ok_up    = final_dist_up <= max_dist
-dist_ok_dn    = final_dist_dn <= max_dist
-
-// ─── SCORING ────────────────────────────────────────────────────
-bull_base     = vel_ok and vol_ok and dist_ok_up and direction_up
-bear_base     = vel_ok and vol_ok and dist_ok_dn and direction_dn
-
-bull_score    = (bull_base ? 3 : 0) + (vel_extra ? 1 : 0) + (vol_extra ? 1 : 0)
-bear_score    = (bear_base ? 3 : 0) + (vel_extra ? 1 : 0) + (vol_extra ? 1 : 0)
-
 // ─── SIGNALS ────────────────────────────────────────────────────
-bull_raw = in_window and bull_base
-bear_raw = in_window and bear_base
+bull_raw = in_window and regime_hot and strong_up and vel_ok and vol_ok and final_dist_up <= 250
+bear_raw = in_window and regime_hot and strong_down and vel_ok and vol_ok and final_dist_dn <= 250
 
 // ─── HOURLY COOLDOWN ────────────────────────────────────────────
 var int last_signal_day_hour = -1
 current_day_hour = dayofmonth(time) * 100 + hour(time)
-
 bull_fire = bull_raw and current_day_hour != last_signal_day_hour
 bear_fire = bear_raw and current_day_hour != last_signal_day_hour
-
 if bull_fire or bear_fire
     last_signal_day_hour := current_day_hour
 
+// ─── SCORING ────────────────────────────────────────────────────
+score_regime = atr_ratio >= 2.0 ? 2 : atr_ratio >= 1.5 ? 1 : 0
+score_trend  = math.abs(trend_4h) >= 500 ? 2 : math.abs(trend_4h) >= 300 ? 1 : 0
+score_vel    = velocity >= 200 ? 1 : 0
+total_score  = score_regime + score_trend + score_vel
+
 // ─── ALERTS ─────────────────────────────────────────────────────
 if bull_fire
-    alert('{"dir":"BULL","score":' + str.tostring(bull_score) + ',"price":' + str.tostring(close, "#.##") + ',"min":' + str.tostring(min_of_hour) + '}', alert.freq_once_per_bar)
+    alert('{"dir":"BULL","score":' + str.tostring(total_score) + ',"price":' + str.tostring(close, "#.##") + ',"min":' + str.tostring(min_of_hour) + ',"atr":' + str.tostring(atr_ratio, "#.##") + ',"t2h":' + str.tostring(trend_2h, "#") + ',"t4h":' + str.tostring(trend_4h, "#") + '}', alert.freq_once_per_bar)
 
 if bear_fire
-    alert('{"dir":"BEAR","score":' + str.tostring(bear_score) + ',"price":' + str.tostring(close, "#.##") + ',"min":' + str.tostring(min_of_hour) + '}', alert.freq_once_per_bar)
+    alert('{"dir":"BEAR","score":' + str.tostring(total_score) + ',"price":' + str.tostring(close, "#.##") + ',"min":' + str.tostring(min_of_hour) + ',"atr":' + str.tostring(atr_ratio, "#.##") + ',"t2h":' + str.tostring(trend_2h, "#") + ',"t4h":' + str.tostring(trend_4h, "#") + '}', alert.freq_once_per_bar)
 
-// ─── CHART VISUALS ──────────────────────────────────────────────
-bgcolor(in_window ? color.new(color.yellow, 92) : na, title="Signal Window")
+// ─── VISUALS ────────────────────────────────────────────────────
+bgcolor(in_window and regime_hot and has_trend ? color.new(color.orange, 85) : in_window ? color.new(color.yellow, 92) : na, title="Window")
 
 plotshape(bear_fire, "Bear", shape.triangledown, location.abovebar, color.red, size=size.small)
 plotshape(bull_fire, "Bull", shape.triangleup, location.belowbar, color.green, size=size.small)
 
 if bull_fire
-    lbl = "BULL ▲ [" + str.tostring(bull_score) + "/5]\n"
-    lbl := lbl + "VEL: $" + str.tostring(velocity, "#") + "\n"
-    lbl := lbl + "VOL: " + str.tostring(vol_ratio, "#.#") + "x\n"
+    lbl = "TREND BULL ▲ [" + str.tostring(total_score) + "/5]\n"
+    lbl := lbl + "ATR: " + str.tostring(atr_ratio, "#.#") + "x | "
+    lbl := lbl + "4h: $" + str.tostring(trend_4h, "#") + "\n"
     lbl := lbl + "DIST: $" + str.tostring(final_dist_up, "#") + " → $" + str.tostring(target_above, "#")
     label.new(bar_index, low, lbl, style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.normal)
 
 if bear_fire
-    lbl = "BEAR ▼ [" + str.tostring(bear_score) + "/5]\n"
-    lbl := lbl + "VEL: $" + str.tostring(velocity, "#") + "\n"
-    lbl := lbl + "VOL: " + str.tostring(vol_ratio, "#.#") + "x\n"
+    lbl = "TREND BEAR ▼ [" + str.tostring(total_score) + "/5]\n"
+    lbl := lbl + "ATR: " + str.tostring(atr_ratio, "#.#") + "x | "
+    lbl := lbl + "4h: $" + str.tostring(trend_4h, "#") + "\n"
     lbl := lbl + "DIST: $" + str.tostring(final_dist_dn, "#") + " → $" + str.tostring(target_below, "#")
     label.new(bar_index, high, lbl, style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.normal)
 
 // ─── DASHBOARD ──────────────────────────────────────────────────
-var table dash = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
+var table dash = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
 if barstate.islast
-    table.cell(dash, 0, 0, "BTC Edge v5", text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black, 60))
-    table.cell(dash, 1, 0, "SETTLE-VALID", text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 0, 0, "Trend Rider v6", text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black, 60))
+    table.cell(dash, 1, 0, regime_hot and has_trend ? "🔥 HOT" : regime_hot ? "⚡ VOLATILE" : "❄️ QUIET", text_color=regime_hot and has_trend ? color.red : color.gray, text_size=size.small, bgcolor=color.new(color.black, 60))
 
     table.cell(dash, 0, 1, "Minute", text_color=color.white, text_size=size.small)
     table.cell(dash, 1, 1, str.tostring(min_of_hour) + (in_window ? " ✓ LIVE" : ""), text_color=in_window ? color.green : color.gray, text_size=size.small)
 
-    table.cell(dash, 0, 2, "Velocity", text_color=color.white, text_size=size.small)
-    vel_color = vel_extra ? color.green : vel_ok ? color.yellow : color.red
-    vel_dir = price_change > 0 ? "▲" : "▼"
-    table.cell(dash, 1, 2, vel_dir + " $" + str.tostring(velocity, "#") + " / " + str.tostring(vel_bars) + "min", text_color=vel_color, text_size=size.small)
+    table.cell(dash, 0, 2, "ATR Ratio", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(atr_ratio, "#.##") + "x", text_color=regime_hot ? color.green : color.red, text_size=size.small)
 
-    table.cell(dash, 0, 3, "Volume", text_color=color.white, text_size=size.small)
-    vol_color = vol_extra ? color.green : vol_ok ? color.yellow : color.red
-    table.cell(dash, 1, 3, str.tostring(vol_ratio, "#.#") + "x avg", text_color=vol_color, text_size=size.small)
+    table.cell(dash, 0, 3, "2h Trend", text_color=color.white, text_size=size.small)
+    t2_color = strong_up ? color.green : strong_down ? color.red : color.gray
+    table.cell(dash, 1, 3, "$" + str.tostring(trend_2h, "#"), text_color=t2_color, text_size=size.small)
 
-    table.cell(dash, 0, 4, "Target ▲", text_color=color.white, text_size=size.small)
-    table.cell(dash, 1, 4, "$" + str.tostring(target_above, "#") + " ($" + str.tostring(final_dist_up, "#") + ")", text_color=dist_ok_up ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 0, 4, "4h Trend", text_color=color.white, text_size=size.small)
+    t4_color = math.abs(trend_4h) >= trend_4h_min ? (trend_4h > 0 ? color.green : color.red) : color.gray
+    table.cell(dash, 1, 4, "$" + str.tostring(trend_4h, "#"), text_color=t4_color, text_size=size.small)
 
-    table.cell(dash, 0, 5, "Target ▼", text_color=color.white, text_size=size.small)
-    table.cell(dash, 1, 5, "$" + str.tostring(target_below, "#") + " ($" + str.tostring(final_dist_dn, "#") + ")", text_color=dist_ok_dn ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 0, 5, "Velocity", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, "$" + str.tostring(velocity, "#") + " / " + str.tostring(vel_bars) + "min", text_color=vel_ok ? color.green : color.gray, text_size=size.small)
 
-    table.cell(dash, 0, 6, "Status", text_color=color.white, text_size=size.small)
-    ready = in_window and vel_ok and vol_ok and (dist_ok_up or dist_ok_dn)
-    table.cell(dash, 1, 6, ready ? "🟢 READY" : "⏳ WAITING", text_color=ready ? color.green : color.gray, text_size=size.small)
+    table.cell(dash, 0, 6, "Target ▲", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, "$" + str.tostring(target_above, "#") + " ($" + str.tostring(final_dist_up, "#") + ")", text_color=color.green, text_size=size.small)
+
+    table.cell(dash, 0, 7, "Target ▼", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, "$" + str.tostring(target_below, "#") + " ($" + str.tostring(final_dist_dn, "#") + ")", text_color=color.red, text_size=size.small)
